@@ -34,6 +34,15 @@ mdat_all <- as.data.frame(
         )
 )
 
+# Remove the effect of blood-CSF barrier permeability (QAlb) from every protein
+# before fitting/applying the clocks (see qalb_residualize)
+residualize_qalb <- TRUE
+
+mdat_runs <- mdat_all[!is.na(mdat_all$Run_timsTOFMeasurement), ]
+mdat_runs <- mdat_runs[!duplicated(mdat_runs$Run_timsTOFMeasurement), ]
+qalb_lookup <- setNames(mdat_runs$QAlb_log2, make.names(mdat_runs$Run_timsTOFMeasurement))
+age_lookup <- setNames(mdat_runs$Age, make.names(mdat_runs$Run_timsTOFMeasurement))
+
 
 # Functions
 ################################################################################
@@ -158,7 +167,39 @@ batch_normalize <- function(train_x, train_batch, test_x, test_batch) {
                 norm_transform(test_x[test_batch == b, , drop=FALSE], b)
         }))
         
-        list(train = train_out, test = test_out)
+        # Return rows in the input order (the rbind above groups them by batch,
+        # which misaligns them with the outcome vector when samples are not
+        # sorted by batch)
+        list(train = train_out[rownames(train_x), , drop = FALSE],
+             test = test_out[rownames(test_x), , drop = FALSE])
+}
+
+# Residualize each protein on QAlb_log2. Slopes are estimated in the training
+# samples with age as covariate (so the age signal correlated with QAlb is not
+# removed), and only the QAlb term is subtracted, in train and test, so
+# prediction needs QAlb but not age. Samples are matched by rownames to
+# qalb_lookup/age_lookup; missing QAlb is set to the training median.
+qalb_residualize <- function(train_x, test_x){
+        if (!residualize_qalb){
+                return(list(train = train_x, test = test_x))
+        }
+        q_tr <- unname(qalb_lookup[rownames(train_x)])
+        a_tr <- unname(age_lookup[rownames(train_x)])
+        q_te <- unname(qalb_lookup[rownames(test_x)])
+        ok_samp <- !is.na(q_tr) & !is.na(a_tr)
+        q_med <- median(q_tr, na.rm = TRUE)
+        q_mu <- mean(q_tr[ok_samp])
+        betas <- apply(train_x, 2, function(p){
+                ok <- ok_samp & !is.na(p)
+                if (sum(ok) < 10) return(0)
+                lm.fit(cbind(1, q_tr[ok], a_tr[ok]), p[ok])$coefficients[2]
+        })
+        betas[is.na(betas)] <- 0
+        q_tr[is.na(q_tr)] <- q_med
+        q_te[is.na(q_te)] <- q_med
+        list(train = train_x - outer(q_tr - q_mu, betas),
+             test = test_x - outer(q_te - q_mu, betas),
+             betas = betas)
 }
 
 impute_train_test <- function(train_x, test_x, method = "mean") {
@@ -258,6 +299,7 @@ for(ct in cell_types){
                 
                 # 1. batch correction (fit on train only)
                 bc <- batch_normalize(X_train, batch_train, X_test, batch_test)
+                bc <- qalb_residualize(bc$train, bc$test)
                 
                 # 2. imputation (train only)
                 imp <- impute_train_test(bc$train, bc$test, method = "mean")
@@ -343,6 +385,7 @@ for(ct in cell_types){
                 batch[batch != hold_out_batch],
                 X_cell_test,
                 batch[batch == hold_out_batch])
+        X_cell_bc <- qalb_residualize(X_cell_bc$train, X_cell_bc$test)
         #X_cell_bc <- X_cell_bc$train
         
         # 2. imputation (train only)
@@ -457,6 +500,8 @@ X_all_bc <- batch_normalize(
         ]
 )
 
+X_all_bc <- qalb_residualize(X_all_bc$train, X_all_bc$test)
+
 X_all_imp <- impute_train_test(X_all_bc$train, X_all_bc$test, method = "mean")
 
 best_alpha <- get_best_alpha(
@@ -552,6 +597,7 @@ for (ct in cell_types){
                 X_cell_test,
                 batch_test
         )
+        X_cell_bc <- qalb_residualize(X_cell_bc$train, X_cell_bc$test)
         #X_cell_bc <- X_cell_bc$train
         
         # 2. imputation (train only)
@@ -835,6 +881,11 @@ X_bc_4wholemod_pred <- batch_normalize(
         ]
 )
 
+
+X_bc_4wholemod_pred <- qalb_residualize(
+        X_bc_4wholemod_pred$train,
+        X_bc_4wholemod_pred$test
+)
 
 X_imp_4wholemod_pred <- impute_train_test(
         X_bc_4wholemod_pred$train,
@@ -1316,11 +1367,11 @@ lobo_clock_predict <- function(prots, alpha, X_bc, age, batch_vec, is_train,
                 tr <- is_train & batch_vec != b & !is.na(age)
                 te <- batch_vec == b
                 keep <- colSums(!is.na(X_bc[tr, prots, drop = FALSE])) > 2
-                imp <- impute_train_test(
+                res <- qalb_residualize(
                         X_bc[tr, prots[keep], drop = FALSE],
-                        X_bc[te, prots[keep], drop = FALSE],
-                        method = "mean"
+                        X_bc[te, prots[keep], drop = FALSE]
                 )
+                imp <- impute_train_test(res$train, res$test, method = "mean")
                 fit <- cv.glmnet(
                         x = as.matrix(imp$train),
                         y = age[tr],
@@ -1487,6 +1538,11 @@ bader_bc <- batch_normalize_keep_order(
         bader_complete,
         samp_df$batch
 )$test
+
+# QAlb-residualized version (slopes from the training controls), used in the
+# protein-level analyses (B, E). Clock predictions residualize within each
+# training fold instead (lobo_clock_predict).
+bader_bc_q <- qalb_residualize(bader_bc[is_train_ctrl, ], bader_bc)$test
 
 ################################################################################
 # A. Out-of-batch clock predictions                                           #
@@ -1665,10 +1721,10 @@ accel_z_wide <- accel_z_wide[samp_df$sample, -1]
 # cell type with random protein sets of the same size (empirical p).
 
 # Standardize every protein using the controls
-ctrl_mu <- colMeans(bader_bc[samp_df$is_ctrl, ], na.rm = TRUE)
-ctrl_sd <- apply(bader_bc[samp_df$is_ctrl, ], 2, sd, na.rm = TRUE)
-ok_prot <- colSums(!is.na(bader_bc[samp_df$is_ctrl, ])) >= 30 & ctrl_sd > 0 & !is.na(ctrl_sd)
-P_std <- sweep(sweep(bader_bc[, ok_prot], 2, ctrl_mu[ok_prot], "-"), 2, ctrl_sd[ok_prot], "/")
+ctrl_mu <- colMeans(bader_bc_q[samp_df$is_ctrl, ], na.rm = TRUE)
+ctrl_sd <- apply(bader_bc_q[samp_df$is_ctrl, ], 2, sd, na.rm = TRUE)
+ok_prot <- colSums(!is.na(bader_bc_q[samp_df$is_ctrl, ])) >= 30 & ctrl_sd > 0 & !is.na(ctrl_sd)
+P_std <- sweep(sweep(bader_bc_q[, ok_prot], 2, ctrl_mu[ok_prot], "-"), 2, ctrl_sd[ok_prot], "/")
 
 # Coefficient of a term for every column of P, with per-protein NA handling
 coef_per_protein <- function(P, design, term){
@@ -1712,7 +1768,7 @@ alignment_stat <- function(ba, bd){
           eq_years = unname(coef(lm(bd[ok] ~ 0 + ba[ok]))[1]))
 }
 
-n_null <- 500
+n_null <- 5000
 set.seed(42)
 align_res <- list()
 for (ct in cell_clocks){
@@ -2064,10 +2120,10 @@ for (ct in cell_clocks){
                 cov_df <- droplevels(cov_df[keep, , drop = FALSE])
                 
                 res_gap <- cv_auc(yv, covars = cbind(cov_df, accel = accel_oof_wide[idx_w, ct]))
-                res_prot <- cv_auc(yv, X = bader_bc[idx_w, prots_ct, drop = FALSE], covars = cov_df)
+                res_prot <- cv_auc(yv, X = bader_bc_q[idx_w, prots_ct, drop = FALSE], covars = cov_df)
                 res_rand <- sapply(seq_len(n_rand_sets), function(i){
                         rp <- sample(setdiff(colnames(P_std), prots_ct), length(prots_ct))
-                        cv_auc(yv, X = bader_bc[idx_w, rp, drop = FALSE], covars = cov_df, n_rep = 2)["auc"]
+                        cv_auc(yv, X = bader_bc_q[idx_w, rp, drop = FALSE], covars = cov_df, n_rep = 2)["auc"]
                 })
                 gapper_clf[[paste(ct, outc)]] <- data.frame(
                         cell_type = ct, outcome = outc,
@@ -2120,8 +2176,8 @@ if (best_case$outcome == "Any disease"){
         yv <- as.numeric(samp_df$diagnosis_detailed[idx] == best_case$outcome)
 }
 prots_best <- intersect(clock_feats[[best_case$cell_type]], colnames(bader_bc))
-X_best <- impute_train_test(bader_bc[idx, prots_best, drop = FALSE],
-                            bader_bc[idx, prots_best, drop = FALSE])$train
+X_best <- impute_train_test(bader_bc_q[idx, prots_best, drop = FALSE],
+                            bader_bc_q[idx, prots_best, drop = FALSE])$train
 fit_best <- cv.glmnet(scale(as.matrix(X_best)), yv, family = "binomial", alpha = 0.5)
 coef_best <- as.matrix(coef(fit_best, s = "lambda.min"))
 coef_best <- data.frame(protein = rownames(coef_best), coef = coef_best[, 1])
@@ -2299,7 +2355,8 @@ if (length(rep_ids) > 0){
         for (ct in cell_clocks){
                 prots <- intersect(clock_feats[[ct]], common_prots)
                 tr <- is_train_ctrl & !is.na(samp_df$age)
-                imp <- impute_train_test(bader_bc[tr, prots], long_bc[, prots])
+                res <- qalb_residualize(bader_bc[tr, prots], long_bc[, prots])
+                imp <- impute_train_test(res$train, res$test)
                 fit <- cv.glmnet(as.matrix(imp$train), samp_df$age[tr],
                                  alpha = clock_alphas[[ct]], nfolds = 5)
                 pr <- predict(fit, newx = as.matrix(imp$test), s = "lambda.min")[, 1]
@@ -2352,221 +2409,3 @@ if (length(rep_ids) > 0){
                height = 6, width = 9)
         write.csv(long_res, file.path(meet_dir, "I_longitudinal_acceleration_lmm.csv"))
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-diseases <- unique(acceleration_df$diagnosis)
-diseases <- diseases[diseases != "Neurological Control"]
-for(d in diseases){
-        acceleration_df_d <- acceleration_df[
-                acceleration_df$diagnosis %in% c("Neurological Control", d),
-        ]
-        acceleration_df_d$diagnosis <- factor(
-                acceleration_df_d$diagnosis,
-                levels = c("Neurological Control", d)
-        )
-        fit <- lmerTest::lmer(
-                acceleration ~ cell_type + (1 | sample),
-                data = acceleration_df_d
-        )
-        coef(summary(fit))
-}
-
-
-
-
-
-
-
-
-
-
-
-library(lme4)
-
-lme4::lmer()
-
-cell_types <- unique(deg_list$cell_type)
-
-cv_res_list <- list()
-final_mod_res <- list()
-glm_list <- list()
-for(ct in cell_types){
-        print(sprintf("Fitting %s model...", ct))
-        results_glm <- c()
-        r2_glm_cv <- c()
-        results_xgb <- c()
-        r2_xgb_cv <- c()
-        
-        X_cell <- X[, prot_info$protein[prot_info$ensembl_gene_id %in% deg_list$gene[deg_list$cell_type == ct]]]
-        
-        prot_stats_glm_cv <- data.frame(protein = colnames(X_cell),
-                                        times_selected = 0)
-        selected_alphas <- numeric(length(batches))
-        for (b in batches) {
-                
-                test_idx <- batch == b
-                train_idx <- !test_idx
-                
-                X_train <- X_cell[train_idx, ]
-                X_test  <- X_cell[test_idx, ]
-                
-                y_train <- y[train_idx]
-                y_test  <- y[test_idx]
-                
-                batch_train <- batch[train_idx]
-                batch_test  <- batch[test_idx]
-                
-                # 1. batch correction (fit on train only)
-                bc <- batch_normalize(X_train, batch_train, X_test, batch_test)
-                
-                # 2. imputation (train only)
-                imp <- impute_train_test(bc$train, bc$test, method = "mean")
-                
-                Xtr <- imp$train
-                Xte <- imp$test
-                
-                ##########################################################################
-                # GLM
-                ##########################################################################
-                
-                best_alpha <- get_best_alpha(Xtr, y_train)
-                selected_alphas <- c(selected_alphas, best_alpha$best_alpha)
-                
-                cvfit <- cv.glmnet(
-                        x = as.matrix(Xtr),
-                        y = y_train,
-                        family = "gaussian",
-                        alpha = best_alpha$best_alpha,
-                        nfolds = 5
-                )
-                
-                pred_glm <- predict(cvfit, newx = as.matrix(Xte), s = "lambda.min")
-                
-                r2_glm <- get_r2(y_test, pred_glm)
-                r2_glm_cv <- c(r2_glm_cv, r2_glm)
-                results_glm <- c(results_glm, cor(pred_glm, y_test, use="complete.obs"))
-                
-                coefs <- coef(cvfit, s = "lambda.min")
-                prot_diff_zero <- coefs[, 1][coefs[, 1] != 0]
-                prot_diff_zero <- prot_diff_zero[names(prot_diff_zero) != "(Intercept)"]
-                
-                prot_stats_glm_cv$times_selected[
-                        prot_stats_glm_cv$protein %in% names(prot_diff_zero)
-                ] <- prot_stats_glm_cv$times_selected[
-                        prot_stats_glm_cv$protein %in% names(prot_diff_zero)
-                ] + 1
-                
-                ##########################################################################
-                # XGBOOST
-                ##########################################################################
-                
-                dtrain <- xgb.DMatrix(as.matrix(Xtr), label = y_train)
-                dtest  <- xgb.DMatrix(as.matrix(Xte), label = y_test)
-                
-                params <- list(
-                        objective = "reg:squarederror",
-                        max_depth = 4,
-                        eta = 0.05,
-                        subsample = 0.8,
-                        seed = 123,
-                        colsample_bytree = 0.8
-                )
-                
-                xgb_fit <- xgb.train(params, dtrain, nrounds = 200, verbose = 0)
-                
-                pred_xgb <- predict(xgb_fit, dtest)
-                
-                r2_xgb <- get_r2(y_test, pred_xgb)
-                r2_xgb_cv <- c(r2_xgb_cv, r2_xgb)
-                results_xgb <- c(results_xgb, cor(pred_xgb, y_test, use="complete.obs"))
-        }
-        
-        mean(results_glm)
-        mean(results_xgb)
-        mean(r2_glm_cv)
-        mean(r2_xgb_cv)
-        
-        final_alpha <- as.numeric(
-                names(
-                        which.max(
-                                table(selected_alphas)
-                        )
-                )
-        )
-        
-        prot_stats_glm_cv$times_selected <- prot_stats_glm_cv$times_selected / length(batches)
-        
-        sel_prots <- prot_stats_glm_cv$protein[prot_stats_glm_cv$times_selected >= .5]
-        
-        X_cell_bc <- batch_normalize(
-                X_cell,
-                batch,
-                X_cell,
-                batch)
-        #X_cell_bc <- X_cell_bc$train
-        
-        # 2. imputation (train only)
-        X_cell_imp <- impute_train_test(X_cell_bc$train, X_cell_bc$train, method = "mean")
-        
-        final_cvfit <- cv.glmnet(
-                x = as.matrix(X_cell_imp$train[, sel_prots]),
-                y = y,
-                family = "gaussian",
-                alpha = final_alpha,
-                nfolds = 5
-        )
-        
-        pred_glm_final <- predict(
-                final_cvfit,
-                newx = as.matrix(X_cell_imp$train[, sel_prots]),
-                s = "lambda.min"
-        )
-        
-        glm_cor_final <- cor(y, pred_glm_final)
-        glm_r2_final <- get_r2(y, pred_glm_final)
-        
-        cv_df <- data.frame(
-                cell_type = ct,
-                fold =  batches,
-                glm_cor = results_glm,
-                glm_r2 = r2_glm_cv,
-                xgb_cor = results_xgb,
-                xgb_r2 = r2_xgb_cv
-        )
-        cv_res_list[[ct]] <- cv_df
-        final_mod_perf <- data.frame(cell_type = ct, glm_cor = glm_cor_final, glm_r2 = glm_r2_final)
-        final_mod_res[[ct]] <- final_mod_perf
-        glm_list[[ct]] <- final_cvfit
-}
-
-final_mod_res <- do.call(rbind.data.frame, final_mod_res)
-
-cv_res_list <- do.call(rbind.data.frame, cv_res_list)
-
-cv_res_mean <- cv_res_list %>%
-        group_by(cell_type) %>%
-        dplyr::summarize(mean_glm_cor = mean(glm_cor),
-                         mean_glm_r2 = mean(glm_r2),
-                         mean_xgb_cor = mean(xgb_cor),
-                         mean_xgb_r2 = mean(xgb_r2))
-
-final_mod_res
-cv_res_mean
